@@ -37,6 +37,8 @@ dependencies:
   http: ^1.6.0
   bloc: ^9.2.1
   flutter_bloc: ^9.1.1
+  file_picker: ^12.2.0
+  syncfusion_flutter_pdf: ^34.2.7
 
 dev_dependencies:
   flutter_test:
