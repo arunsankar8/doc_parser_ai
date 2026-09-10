@@ -4,6 +4,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
+import 'api_remote.dart';
+
 class Slice2Home extends StatefulWidget {
   const Slice2Home({super.key, required this.title});
 
@@ -22,6 +24,15 @@ class _Slice2HomeState extends State<Slice2Home> {
   int? pickedFileBytes;
   String? pickError;
   String? contents;
+  int? tokenCount;
+  String? tokenCountError;
+
+  /// State for asking a question about the picked document.
+  ApiStatus questionStatus = ApiStatus.idle;
+  int? questionTokenCount; // countTokens for [contents, question] combined
+  String answer = '';
+  String? questionError;
+  UsageInfo? lastUsage; // actual usage, from the streamed response
 
   @override
   void dispose() {
@@ -30,7 +41,11 @@ class _Slice2HomeState extends State<Slice2Home> {
   }
 
   Future<void> pickPdf() async {
-    setState(() => pickError = null);
+    setState(() {
+      pickError = null;
+      tokenCount = null;
+      tokenCountError = null;
+    });
     try {
       final file = await FilePicker.pickFile(
         type: FileType.custom,
@@ -47,15 +62,28 @@ class _Slice2HomeState extends State<Slice2Home> {
       }
 
       final bytes = await file.length();
-      contents = await extractDocContent(path);
+      final extracted = await extractDocContent(path);
       setState(() {
         pickedFilePath = path;
         pickedFileName = file.name;
         pickedFileBytes = bytes;
+        contents = extracted;
       });
 
       // ignore: avoid_print
-      print('Picked: $path  ($bytes bytes)');
+
+      // Count tokens for the extracted text. Kept as its own try/catch so a
+      // token-count failure (e.g. rate limit) doesn't wipe out the file
+      // details and extracted text you already have on screen.
+      try {
+        final count = await requestTokenCount([extracted]);
+        setState(() => tokenCount = count);
+      } on ApiException catch (e) {
+        setState(() => tokenCountError = e.userMessage);
+      }
+      print(
+        'Picked: $pickedFileName  ($bytes bytes) -- (${contents?.length})  -- tokenCount - $tokenCount',
+      );
     } catch (e) {
       setState(() => pickError = 'File pick failed: $e');
     }
@@ -88,11 +116,13 @@ class _Slice2HomeState extends State<Slice2Home> {
               child: TextField(
                 controller: controller,
                 style: TextStyle(fontSize: 18),
+                onSubmitted: (_) => askQuestion(),
                 decoration: InputDecoration(
                   hint: Text('Ask about the file'),
                   suffixIcon: IconButton(
-                    onPressed: () {},
-
+                    onPressed: questionStatus == ApiStatus.streaming
+                        ? null
+                        : askQuestion,
                     icon: Icon(Icons.send),
                   ),
                 ),
@@ -125,7 +155,9 @@ class _Slice2HomeState extends State<Slice2Home> {
                                         'size: $pickedFileBytes bytes '
                                         '(${(pickedFileBytes! / 1024).toStringAsFixed(1)} KB)\n'
                                         'path: $pickedFilePath\n'
-                                        'Contents : $contents',
+                                        'tokens: ${tokenCount ?? tokenCountError ?? 'counting…'}'
+                                        '${tokenCount != null ? '  (~\$${((tokenCount! / 1000000) * inputPricePerMillion).toStringAsFixed(4)} per question, input only)' : ''}\n'
+                                        'Contents size : ${contents?.length}',
                               style: const TextStyle(fontSize: 14),
                             ),
                           ),
@@ -135,7 +167,7 @@ class _Slice2HomeState extends State<Slice2Home> {
                       Row(
                         crossAxisAlignment: .start,
                         children: [
-                          Text(
+                          const Text(
                             "ans: ",
                             style: TextStyle(
                               fontSize: 15,
@@ -147,7 +179,38 @@ class _Slice2HomeState extends State<Slice2Home> {
                               child: Column(
                                 crossAxisAlignment: .start,
                                 children: [
-                                  Text("", style: TextStyle(fontSize: 18)),
+                                  if (questionTokenCount != null)
+                                    Text(
+                                      'question+doc tokens: $questionTokenCount'
+                                      '  (~\$${((questionTokenCount! / 1000000) * inputPricePerMillion).toStringAsFixed(4)} est. input)',
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.grey,
+                                      ),
+                                    ),
+                                  if (questionError != null)
+                                    Text(
+                                      questionError!,
+                                      style: const TextStyle(fontSize: 18),
+                                    )
+                                  else
+                                    Text(
+                                      answer,
+                                      style: const TextStyle(fontSize: 18),
+                                    ),
+                                  if (lastUsage != null)
+                                    Text(
+                                      'actual — input: ${lastUsage!.promptTokens} tok '
+                                      '(\$${lastUsage!.inputCost.toStringAsFixed(4)}), '
+                                      'output: ${lastUsage!.candidatesTokens} tok visible '
+                                      '+ ${lastUsage!.thoughtsTokens} thinking '
+                                      '(\$${lastUsage!.outputCost.toStringAsFixed(4)}), '
+                                      'total: \$${lastUsage!.totalCost.toStringAsFixed(4)}',
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.grey,
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
@@ -163,6 +226,57 @@ class _Slice2HomeState extends State<Slice2Home> {
         ),
       ),
     );
+  }
+
+  Future<void> askQuestion() async {
+    final question = controller.text.trim();
+    if (question.isEmpty || contents == null) return;
+
+    setState(() {
+      questionStatus = ApiStatus.streaming;
+      questionTokenCount = null;
+      questionError = null;
+      answer = '';
+      lastUsage = null;
+    });
+
+    final parts = [contents!, question];
+
+    // Step 1: count tokens for document + question together, before
+    // sending anything to generateContent.
+    try {
+      final count = await requestTokenCount(parts);
+      setState(() => questionTokenCount = count);
+    } on ApiException catch (e) {
+      setState(() {
+        questionError = e.userMessage;
+        questionStatus = ApiStatus.failed;
+      });
+      return; // don't send if we couldn't even count tokens
+    }
+
+    // Step 2: only on success of the count above, stream the answer.
+    try {
+      final buffer = StringBuffer();
+      await for (final chunk in streamLlmApiResponse(
+        parts,
+        onUsage: (usage) => lastUsage = usage,
+      )) {
+        buffer.write(chunk);
+        setState(() => answer = buffer.toString());
+      }
+      setState(() => questionStatus = ApiStatus.completed);
+    } on ApiException catch (e) {
+      setState(() {
+        questionError = e.userMessage;
+        questionStatus = ApiStatus.failed;
+      });
+    } on SocketException {
+      setState(() {
+        questionError = 'No connection';
+        questionStatus = ApiStatus.failed;
+      });
+    }
   }
 
   Future<String> extractDocContent(String fileName) async {

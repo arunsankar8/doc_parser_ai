@@ -111,7 +111,7 @@ class AiCubit extends Cubit<AICubitState> {
   Future<void> callApi(String prompt) async {
     try {
       emit(AIResponseState(text: currentValue, status: ApiStatus.streaming));
-      await for (String chunk in streamLlmApiResponse(prompt)) {
+      await for (String chunk in streamLlmApiResponse([prompt])) {
         currentValue += chunk;
         emit(AIResponseState(text: currentValue, status: ApiStatus.streaming));
       }
