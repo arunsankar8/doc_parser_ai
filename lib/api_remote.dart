@@ -2,10 +2,30 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
-const model = 'gemini-3.6-flash';
+/// Free-tier Gemini models, newest/most-capable first. When one is
+/// overloaded ("high demand" 503/429), switch to another via
+/// [selectedModel] instead of waiting — they're separate deployments with
+/// separate capacity.
+const availableModels = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+];
+
+/// The model every request uses. Mutable on purpose — the UI's model
+/// dropdown writes to this directly. Not a Cubit/state-managed value because
+/// nothing needs to *react* to it changing; the next request just reads
+/// whatever it currently is.
+String selectedModel = availableModels.first;
+
 const basePath = "https://generativelanguage.googleapis.com/v1beta/models/";
-const endpointStreaming = '$model:streamGenerateContent?alt=sse';
-const endpointCountTokens = '$model:countTokens';
+String endpointStreaming(String model) => '$model:streamGenerateContent?alt=sse';
+String endpointCountTokens(String model) => '$model:countTokens';
 
 // Gemini Standard tier pricing, per 1M tokens (USD), effective through
 // 2026-12-31. Source: ai.google.dev/pricing — re-check before 2027-01-01,
@@ -50,7 +70,7 @@ Stream<String> streamLlmApiResponse(
   try {
     var request = createRequestHeader(
       parts,
-      endpointStreaming,
+      endpointStreaming(selectedModel),
       includeSystemInstruction: true,
     );
 
@@ -123,7 +143,7 @@ Future<int> requestTokenCount(List<String> parts) async {
   try {
     var request = createRequestHeader(
       parts,
-      endpointCountTokens,
+      endpointCountTokens(selectedModel),
       includeSystemInstruction: false,
     );
 
